@@ -23,6 +23,7 @@
 #define GREEN_GPU_DFINTEGRAL_H
 
 #include <green/symmetry/symmetry.h>
+#include <green/integrals/thc_factor_data.h>
 #include <hdf5.h>
 #include <hdf5_hl.h>
 
@@ -50,8 +51,14 @@ namespace green::gpu {
     using MatrixXcd = Eigen::Matrix<std::complex<double>, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>;
     using MatrixXcf = Eigen::Matrix<std::complex<float>, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>;
     using MatrixXd  = Eigen::Matrix<double, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>;
-    df_integral_t(const std::string& path, int nao, int nk, int NQ, const bz_utils_t& bz_utils) :
+    df_integral_t(const std::string& path, int nao, int nk, int NQ, const bz_utils_t& bz_utils, const integrals::thc_reader_options& options = {}) :
         _vij_Q(1, NQ, nao, nao), _k0(-1), _current_chunk(-1), _chunk_size(0), _bz_utils(bz_utils), _base_path(path) {
+      if(integrals::thc_factor_data::exists(path)) {
+        _thc=std::make_shared<integrals::thc_factor_data>(path,nk,nao,NQ,options);
+        _chunk_size=1;
+        return;
+      }
+      if(options.enabled) throw std::runtime_error("explicit THC representation requires thc_meta.h5");
       hid_t file = H5Fopen((path + "/meta.h5").c_str(), H5F_ACC_RDONLY, H5P_DEFAULT);
       if (H5LTread_dataset_long(file, "chunk_size", &_chunk_size) < 0) throw std::logic_error("Fails on reading chunk_size.");
       H5Fclose(file);
@@ -66,6 +73,7 @@ namespace green::gpu {
      * @param k2
      */
     void read_integrals(size_t k1, size_t k2) {
+      if(_thc) return; // the owning pair buffer is filled by symmetrize before CUDA upload
       assert(k1 >= 0);
       assert(k2 >= 0);
       // Find corresponding index for k-pair (k1,k2). Only k-pair with k1 > k2 will be stored.
@@ -94,6 +102,7 @@ namespace green::gpu {
      */
     template <typename type>
     void read_entire(std::complex<type>* Vk1k2_Qij, int intranode_rank, int processes_per_node) {
+      if(_thc) throw std::runtime_error("THC GPU reconstruction currently requires cuda_low_cpu_memory true");
       const int NQ               = _vij_Q.shape()[1];
       const int nao              = _vij_Q.shape()[2];
       size_t    num_kpair_stored = _bz_utils.k_symmetry().num_kpair_stored();
@@ -134,6 +143,7 @@ namespace green::gpu {
      * \param V_buffer - buffer to read data into
      */
     void read_a_chunk(size_t c_id, ztensor<4>& V_buffer) {
+      if(_thc) throw std::logic_error("THC has no legacy chunk buffers");
       std::string fname = _base_path + "/" + rval_ + "_" + std::to_string(c_id) + ".h5";
       hid_t       file  = H5Fopen(fname.c_str(), H5F_ACC_RDONLY, H5P_DEFAULT);
 
@@ -174,6 +184,13 @@ namespace green::gpu {
      */
     template <typename prec>
     void symmetrize(tensor<prec, 3>& vij_Q_k1k2, const size_t k1, const size_t k2) {
+      if(_thc) {
+        if(vij_Q_k1k2.shape()!=std::array<size_t,3>{_thc->naux(),_thc->nao(),_thc->nao()}) throw std::logic_error("THC GPU host target shape mismatch");
+        std::vector<std::complex<double>> pair(vij_Q_k1k2.size());
+        _thc->reconstruct(k1,k2,pair.data());
+        Complex_DoubleToType(pair.data(),vij_Q_k1k2.data(),pair.size());
+        return;
+      }
       int                                      k1k2_wrap = wrap(k1, k2);
       std::pair<int, integral_symmetry_type_e> vtype     = v_type(k1, k2);
       int                                      NQ        = _vij_Q.shape()[1];
@@ -206,6 +223,7 @@ namespace green::gpu {
      */
     template <typename prec>
     void symmetrize(std::complex<double>* Vk1k2_Qij, tensor<prec, 3>& V, const int k1, const int k2) {
+      if(_thc) throw std::runtime_error("THC GPU reconstruction currently requires cuda_low_cpu_memory true");
       int                                      k1k2_wrap        = wrap(k1, k2, as_a_whole);
       std::pair<int, integral_symmetry_type_e> vtype            = v_type(k1, k2);
       size_t                                   NQ               = V.shape()[0];
@@ -247,6 +265,7 @@ namespace green::gpu {
     }
 
   private:
+    std::shared_ptr<integrals::thc_factor_data> _thc;
     // Coulomb integrals stored in density fitting format
     ztensor<4> _vij_Q;
     // current leading index

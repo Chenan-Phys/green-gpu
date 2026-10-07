@@ -43,9 +43,13 @@ namespace green::gpu {
         _naosq(nao * nao), _nao3(nao * nao * nao), _NQnaosq(NQ * nao * nao), _nk_batch(0), _devices_comm(MPI_COMM_NULL),
         _devices_rank(0), _devices_size(0), _shared_win(MPI_WIN_NULL), _devCount_total(0), _devCount_per_node(0),
         _low_device_memory(p["cuda_low_gpu_memory"]), _verbose(p["verbose"]), _Vk1k2_Qij(nullptr) {
+      _thc_options=integrals::thc_options(p);
+      _thc_options.preload_all_cores=!p["cuda_low_cpu_memory"].as<bool>();
       check_for_cuda(utils::context().global, utils::context().global_rank, _devCount_per_node, _verbose);
-      if (p["cuda_low_cpu_memory"].as<bool>()) {
+      if (_thc_options.enabled || p["cuda_low_cpu_memory"].as<bool>()) {
         _coul_int_reading_type = chunks;
+        if(_thc_options.enabled && !utils::context().global_rank)
+          std::cout<<"THC host factors: "<<(_thc_options.preload_all_cores?"all cores preloaded":"one q core cached")<<"; pair buffers are bounded"<<std::endl;
       } else {
         _coul_int_reading_type = as_a_whole;
       }
@@ -119,6 +123,7 @@ namespace green::gpu {
 
   protected:
     df_integral_t*        _coul_int;
+    integrals::thc_reader_options _thc_options;
 
     size_t                _nk;
     size_t                _ink;

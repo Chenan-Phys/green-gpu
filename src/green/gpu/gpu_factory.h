@@ -24,6 +24,7 @@
 
 #include <green/gpu/gw_gpu_kernel.h>
 #include <green/gpu/hf_gpu_kernel.h>
+#include <green/gpu/thc_gpu_kernels.h>
 
 namespace green::gpu {
   using bz_utils_t = symmetry::brillouin_zone_utils;
@@ -47,6 +48,13 @@ namespace green::gpu {
   inline std::tuple<std::shared_ptr<void>, std::function<x_type(const x_type&)>> custom_hf_kernel(
       bool X2C, const params::params& p, size_t nao, size_t nso, size_t ns, size_t NQ, double madelung,
       const bz_utils_t& bz_utils, const ztensor<4>& S_k) {
+    if(integrals::thc_options(p).enabled && p["thc_mode"].as<std::string>()=="native") {
+      if(p["nt_batch"].as<size_t>())throw std::runtime_error("native THC uses budgeted one-q tau workspaces; nt_batch override is unsupported");
+      if(X2C || bz_utils.ink()!=bz_utils.nk() || bz_utils.inq()!=bz_utils.nq())throw std::runtime_error("native GPU THC requires scalar full BZ");
+      auto kernel=std::make_shared<thc_hf_gpu_kernel>(p,nao,ns,NQ,madelung,bz_utils,S_k);
+      std::function<x_type(const x_type&)> callback=[kernel](const x_type& dm){return kernel->solve(dm);};
+      return std::tuple{std::shared_ptr<void>(kernel),callback};
+    }
     if(X2C) {
       std::shared_ptr<void> kernel(new x2c_hf_gpu_kernel(p, nao, nso, ns, NQ, madelung, bz_utils, S_k));
       std::function         callback = [kernel](const x_type& dm) -> x_type {
@@ -78,6 +86,14 @@ namespace green::gpu {
   inline std::tuple<std::shared_ptr<void>, std::function<void(G_type&, G_type&)>> custom_gw_kernel(
       bool X2C, const params::params& p, size_t nao, size_t nso, size_t ns, size_t NQ, const grids::transformer_t& ft,
       const bz_utils_t& bz_utils, const ztensor<4>& S_k) {
+    if(integrals::thc_options(p).enabled && p["thc_mode"].as<std::string>()=="native") {
+      if(p["nt_batch"].as<size_t>() || p["cuda_linear_solver"].as<LinearSolverType>()!=LinearSolverType::LU)
+        throw std::runtime_error("native THC GPU requires LU and default budgeted one-q tau workspace");
+      if(X2C || bz_utils.ink()!=bz_utils.nk() || bz_utils.inq()!=bz_utils.nq())throw std::runtime_error("native GPU THC requires scalar full BZ");
+      auto kernel=std::make_shared<thc_gw_gpu_kernel>(p,nao,ns,NQ,ft,bz_utils);
+      std::function<void(G_type&,G_type&)> callback=[kernel](G_type& g,G_type& s){kernel->solve(g,s);};
+      return std::tuple{std::shared_ptr<void>(kernel),callback};
+    }
     if (X2C) {
       std::shared_ptr<void> kernel(new x2c_gw_gpu_kernel(p, nao, nso, ns, NQ, ft, bz_utils, p["cuda_linear_solver"], p["verbose"]));
       std::function callback = [kernel](G_type& g, G_type& s) { static_cast<x2c_gw_gpu_kernel*>(kernel.get())->solve(g, s); };
@@ -93,6 +109,7 @@ namespace green::gpu {
    * \param p simulation parameters object
    */
   inline void custom_kernel_parameters(params::params& p) {
+    integrals::define_thc_parameters(p);
     p.define<int>("verbose", "Print verbose output.", 0);
     p.define<LinearSolverType>("cuda_linear_solver", "Type of linear solver for Bethe-Salpeter equation (LU or Cholesky).",
                                LinearSolverType::LU);
