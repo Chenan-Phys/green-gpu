@@ -5,6 +5,7 @@
 #include "thc_gpu_ops.h"
 #include <green/grids/transformer_t.h>
 #include <green/integrals/thc_factor_data.h>
+#include <green/tensors/thc_gw_fft.h>
 
 namespace green::gpu {
   // Full-BZ, scalar, double-precision v1. Each node leader owns a CUDA
@@ -29,7 +30,11 @@ namespace green::gpu {
       _ns(ns),_nk(bz.nk()),_madelung(madelung),_S(S) {
       _factors=std::make_shared<integrals::thc_factor_data>(p["dfintegral_hf_file"],_nk,nao,NQ,native_gpu_options(p));
       if(_factors->set_kind()!="hf") throw std::runtime_error("native GPU HF requires HF core");
+      if(6.0*_factors->rank()*_factors->rank()*16>double(p["thc_workspace_mb"].as<size_t>())*1024*1024)
+        throw std::runtime_error("native THC GPU HF matrix workspace exceeds declared budget");
       if(!utils::context().node_rank) _ops=std::make_unique<thc_gpu_ops>(p["cuda_low_gpu_memory"].as<bool>());
+      if(!utils::context().global_rank)std::cout<<"Native THC CUDA double: host "<<(p["cuda_low_cpu_memory"].as<bool>()?"one q cached":"all cores preloaded")
+        <<", device "<<(p["cuda_low_gpu_memory"].as<bool>()?"tiles released":"tiles reused")<<std::endl;
     }
     ztensor<4> solve(const ztensor<4>& dm) {
       ztensor<4> result(_ns,_nk,dm.shape()[2],dm.shape()[3]); result.set_zero();
@@ -65,6 +70,8 @@ namespace green::gpu {
   };
   class thc_gw_gpu_kernel {
     size_t _ns,_nk,_nt,_nw;
+    bool _fft=false;
+    size_t _workspace_bytes=0;
     const grids::transformer_t& _ft;
     std::shared_ptr<integrals::thc_factor_data> _factors;
     std::unique_ptr<thc_gpu_ops> _ops;
@@ -76,6 +83,10 @@ namespace green::gpu {
       _factors=std::make_shared<integrals::thc_factor_data>(p["dfintegral_file"],_nk,nao,NQ,native_gpu_options(p));
       if(_factors->set_kind()!="correlation") throw std::runtime_error("native GPU GW requires correlation core");
       const size_t r=_factors->rank();
+      _fft=p["thc_gw_k_contraction"].as<std::string>()=="fft";
+      _workspace_bytes=p["thc_workspace_mb"].as<size_t>()*1024*1024;
+      if(_fft){tensors::thc_momentum_fft layout(*_factors);tensors::check_thc_fft_workspace(*_factors,_nt,_nw,_workspace_bytes);}
+      if(!utils::context().global_rank)std::cout<<"Native THC CUDA GW momentum mode "<<(_fft?"host FFT":"direct sums")<<std::endl;
       if(_nt%2 || double(_nt+_nw)*r*r*16>double(p["thc_workspace_mb"].as<size_t>())*1024*1024)
         throw std::runtime_error("native THC GPU tau/frequency shape or workspace budget unsupported");
       if(!utils::context().node_rank) _ops=std::make_unique<thc_gpu_ops>(p["cuda_low_gpu_memory"].as<bool>());
@@ -86,6 +97,10 @@ namespace green::gpu {
       const size_t r=_factors->rank();
       if(!ctx.node_rank) {
         auto& ops=*_ops;
+        if(_fft) {
+          if(!ctx.internode_rank)tensors::thc_gw_fft_solve(*_factors,_ft,g.object(),sigma.object(),ops,_workspace_bytes);
+          utils::allreduce(MPI_IN_PLACE,sigma.object().data(),sigma.object().size(),MPI_C_DOUBLE_COMPLEX,MPI_SUM,ctx.internode_comm);
+        } else {
         for(size_t q=ctx.internode_rank;q<_factors->nq();q+=ctx.internode_size) {
           ztensor<4> chi(_nt,1,r,r),wc_w(_nw,1,r,r); chi.set_zero();wc_w.set_zero();
           MatrixXcd m=_factors->M(q),Z=ops.gemm(m,m.adjoint());
@@ -122,6 +137,7 @@ namespace green::gpu {
           }
         }
         utils::allreduce(MPI_IN_PLACE,sigma.object().data(),sigma.object().size(),MPI_C_DOUBLE_COMPLEX,MPI_SUM,ctx.internode_comm);
+        }
         if(!ctx.global_rank)report_thc_cuda(ops);
       }
       sigma.fence();

@@ -1,6 +1,6 @@
 
 set(GREEN_SYMMETRY_REPOSITORY "https://github.com/Chenan-Phys/green-symmetry.git" CACHE STRING "Coordinated THC host provider")
-set(GREEN_SYMMETRY_REVISION "5d746d2a57c9d19f561497937fa493b7121d0b2a" CACHE STRING "Validated THC host provider revision")
+set(GREEN_SYMMETRY_REVISION "6fa32dfc6faa134369c6930a88a75a9725f95efd" CACHE STRING "Validated THC host provider revision")
 function(add_green_dependency TARGET)
     Include(FetchContent)
 

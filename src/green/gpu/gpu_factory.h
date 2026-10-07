@@ -110,6 +110,8 @@ namespace green::gpu {
    */
   inline void custom_kernel_parameters(params::params& p) {
     integrals::define_thc_parameters(p);
+    p.define<size_t>("thc_workspace_mb", "Native THC host matrix/tau/frequency workspace budget in MiB", 512);
+    p.define<std::string>("thc_gw_k_contraction", "Native GW momentum contraction: direct or fft", "direct");
     p.define<int>("verbose", "Print verbose output.", 0);
     p.define<LinearSolverType>("cuda_linear_solver", "Type of linear solver for Bethe-Salpeter equation (LU or Cholesky).",
                                LinearSolverType::LU);

@@ -18,11 +18,15 @@ multi-GPU scheduling is not established by the one-GPU tests.
 
 Native P_sp/Sigma_sp, Cholesky screening, nt_batch overrides, spinors, IBZ
 reductions, native GF2 and AqQ/extrapolation are unsupported. The tau/frequency
-workspace is one q at a time with an explicit host budget. Interpolation I is
+workspace is one q at a time in direct mode with an explicit host budget. Interpolation I is
 not Gaussian Q and does not enter the original-Q MPI schedule. GF2 with GPU
 selection still executes GPU HF plus CPU GF2 correlation.
 
 The native implementation prioritizes validated algebra and bounded ownership.
 It transfers many small tiles. A small fixture timing is not a large-system
-speedup or compression guarantee. Production FFT/point-space symmetry and
-multi-device performance require independent work.
+speedup or compression guarantee. Optional native GW
+`--thc_gw_k_contraction fft` runs full-mesh complex momentum transforms on the
+host while CUDA executes projection, screening and backprojection. It uses a
+separate conservative all-q workspace check; all four host/device memory flag
+combinations pass the complex fixture. Point-space symmetry, distributed/device
+FFTs and multi-device performance require independent work.
