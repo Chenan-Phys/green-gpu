@@ -38,6 +38,15 @@ namespace {
   __global__ void elements(z* c,const z* a,const z* b,size_t n) {
     size_t i=size_t(blockIdx.x)*blockDim.x+threadIdx.x;if(i<n)c[i]=cuCmul(a[i],b[i]);
   }
+  __global__ void adjoint_kernel(z* out,const z* in,size_t rows,size_t cols) {
+    __shared__ z tile[16][17];
+    const size_t row=size_t(blockIdx.x)*16+threadIdx.x,col=size_t(blockIdx.y)*16+threadIdx.y;
+    const size_t base=size_t(blockIdx.z)*rows*cols;
+    if(row<rows && col<cols)tile[threadIdx.y][threadIdx.x]=cuConj(in[base+row+col*rows]);
+    __syncthreads();
+    const size_t target_row=size_t(blockIdx.y)*16+threadIdx.x,target_col=size_t(blockIdx.x)*16+threadIdx.y;
+    if(target_row<cols && target_col<rows)out[base+target_row+target_col*cols]=tile[threadIdx.x][threadIdx.y];
+  }
   __global__ void diagonal_sum_kernel(z* out,const z* in,size_t r,size_t count,double scale) {
     size_t i=size_t(blockIdx.x)*blockDim.x+threadIdx.x;if(i>=r)return;z sum=make_cuDoubleComplex(0,0);
     for(size_t k=0;k<count;++k)sum=cuCadd(sum,in[k*r*r+i*(r+1)]);
@@ -144,7 +153,23 @@ struct thc_gpu_resident::implementation {
   cufftHandle plan=0;std::shared_ptr<storage> fft_work;
   std::shared_ptr<storage> transfer,pairs,kmap,qmap,negative;
   size_t nk=0,nq=0,rank=0,gemms=0,solves=0,copies=0,bytes=0,ffts=0;
-  implementation(bool l,size_t b,bool gemm3m):pool(std::make_shared<arena>(b)),low(l),auxiliary_gemm3m(gemm3m){
+  struct event {std::string name;cudaEvent_t begin=nullptr,end=nullptr;};
+  bool profiling=false,profile_failed=false;
+  std::vector<event> events;
+  struct timer {
+    implementation& impl;size_t index=0;bool active=false;
+    timer(implementation& owner,const std::string& name):impl(owner),active(owner.profiling) {
+      if(!active)return;
+      event e;e.name=name;
+      try{check(cudaEventCreate(&e.begin),"profile begin event");check(cudaEventCreate(&e.end),"profile end event");
+          check(cudaEventRecord(e.begin),"profile begin record");}
+      catch(...){if(e.begin)cudaEventDestroy(e.begin);if(e.end)cudaEventDestroy(e.end);throw;}
+      index=impl.events.size();impl.events.push_back(e);
+    }
+    ~timer(){if(active && cudaEventRecord(impl.events[index].end)!=cudaSuccess)impl.profile_failed=true;}
+    timer(const timer&)=delete;
+  };
+  implementation(bool l,size_t b,bool gemm3m,bool profile):pool(std::make_shared<arena>(b)),low(l),auxiliary_gemm3m(gemm3m),profiling(profile){
     try {
       check(cudaSetDevice(0),"device");
       if(auxiliary_gemm3m){
@@ -157,14 +182,15 @@ struct thc_gpu_resident::implementation {
       if(solver)cusolverDnDestroy(solver);if(blas)cublasDestroy(blas);throw;
     }
   }
-  ~implementation(){cudaDeviceSynchronize();if(plan)cufftDestroy(plan);if(blas)cublasDestroy(blas);if(solver)cusolverDnDestroy(solver);}
+  ~implementation(){cudaDeviceSynchronize();for(auto& e:events){cudaEventDestroy(e.begin);cudaEventDestroy(e.end);}
+    if(plan)cufftDestroy(plan);if(blas)cublasDestroy(blas);if(solver)cusolverDnDestroy(solver);}
   template<class T> std::shared_ptr<storage> metadata(const std::vector<T>& values){
     auto result=std::make_shared<storage>(pool,product(values.size(),sizeof(T)));
     check(cudaMemcpy(result->memory.pointer,values.data(),values.size()*sizeof(T),cudaMemcpyHostToDevice),"metadata upload");
     ++copies;bytes+=values.size()*sizeof(T);return result;
   }
 };
-thc_gpu_resident::thc_gpu_resident(bool low,size_t budget,bool auxiliary_gemm3m):_impl(new implementation(low,budget,auxiliary_gemm3m)){}
+thc_gpu_resident::thc_gpu_resident(bool low,size_t budget,bool auxiliary_gemm3m,bool profile):_impl(new implementation(low,budget,auxiliary_gemm3m,profile)){}
 thc_gpu_resident::~thc_gpu_resident()=default;
 thc_gpu_resident::field thc_gpu_resident::allocate(size_t r,size_t c,size_t count,bool clear){
   dimension(r);dimension(c);dimension(count);field f{std::make_shared<storage>(_impl->pool,product(product(product(r,c),count),sizeof(z))),r,c,count,0};
@@ -195,6 +221,7 @@ thc_gpu_resident::field thc_gpu_resident::multiply_impl(const field& a,const fie
   if(!a.owner || !b.owner || ac!=br || (a.count!=1 && a.count!=count) || (b.count!=1 && b.count!=count))throw std::runtime_error("THC batched GEMM mismatch");
   const int rows=dimension(ar),cols=dimension(bc),inner=dimension(ac),lda=dimension(a.rows),ldb=dimension(b.rows),batch=dimension(count);
   const size_t stride_a=a.count==1?0:product(a.rows,a.cols),stride_b=b.count==1?0:product(b.rows,b.cols),stride_c=product(ar,bc);
+  implementation::timer timer(*_impl,_impl->profiling?std::string("gemm_")+ta+tb+"_"+std::to_string(ar)+"x"+std::to_string(bc)+"x"+std::to_string(ac)+"_b"+std::to_string(count)+(gemm3m?"_3m":""):std::string{});
   auto out=allocate(ar,bc,count);z alpha=make_cuDoubleComplex(scale,0),beta=make_cuDoubleComplex(0,0);
   if(gemm3m){
     // cuBLAS has no double-complex GEMM3M batched entry point. Each call
@@ -208,8 +235,23 @@ thc_gpu_resident::field thc_gpu_resident::multiply_impl(const field& a,const fie
   }
   _impl->gemms+=count;return out;
 }
-thc_gpu_resident::field thc_gpu_resident::project(const field& x,const field& g){auto first=multiply(x,g);return multiply(first,x,'N','C');}
-thc_gpu_resident::field thc_gpu_resident::backproject(const field& x,const field& g,double scale){auto first=multiply(x,g,'C','N');return multiply(first,x,'N','N',scale);}
+thc_gpu_resident::field thc_gpu_resident::project(const field& x,const field& g){return project(x,g,field{});}
+thc_gpu_resident::field thc_gpu_resident::project(const field& x,const field& g,const field& h){
+  if(h.owner && (h.rows!=x.cols || h.cols!=x.rows || h.count!=x.count))throw std::runtime_error("THC packed X adjoint mismatch");
+  auto first=multiply(x,g);return h.owner?multiply(first,h):multiply(first,x,'N','C');
+}
+thc_gpu_resident::field thc_gpu_resident::backproject(const field& x,const field& g,double scale){return backproject(x,g,field{},scale);}
+thc_gpu_resident::field thc_gpu_resident::backproject(const field& x,const field& g,const field& h,double scale){
+  if(h.owner && (h.rows!=x.cols || h.cols!=x.rows || h.count!=x.count))throw std::runtime_error("THC packed X adjoint mismatch");
+  auto first=h.owner?multiply(h,g):multiply(x,g,'C','N');return multiply(first,x,'N','N',scale);
+}
+thc_gpu_resident::field thc_gpu_resident::adjoint(const field& in){
+  implementation::timer timer(*_impl,"adjoint_pack");
+  if(in.count>65535 || (in.cols+15)/16>65535)throw std::runtime_error("THC adjoint launch exceeds supported grid");
+  auto out=allocate(in.cols,in.rows,in.count);
+  adjoint_kernel<<<dim3((in.rows+15)/16,(in.cols+15)/16,in.count),dim3(16,16)>>>(data(out),data(in),in.rows,in.cols);
+  check(cudaGetLastError(),"packed adjoint");return out;
+}
 thc_gpu_resident::field thc_gpu_resident::hadamard(const field& a,const field& b){same(a,b);auto out=allocate(a.rows,a.cols,a.count);elements<<<grid(entries(a)),256>>>(data(out),data(a),data(b),entries(a));check(cudaGetLastError(),"Hadamard");return out;}
 thc_gpu_resident::field thc_gpu_resident::diagonal_sum(const field& a,double scale) {
   if(a.rows!=a.cols)throw std::runtime_error("THC density matrix shape");auto out=allocate(a.rows,1);
@@ -222,15 +264,19 @@ thc_gpu_resident::field thc_gpu_resident::diagonal(const field& a) {
 void thc_gpu_resident::add(const field& out,const field& value,double scale){same(out,value);z alpha=make_cuDoubleComplex(scale,0);check(cublasZaxpy(_impl->blas,dimension(entries(out)),&alpha,data(value),1,data(out),1),"accumulate");}
 void thc_gpu_resident::copy(const field& out,const field& value){same(out,value);check(cudaMemcpyAsync(data(out),data(value),entries(out)*sizeof(z),cudaMemcpyDeviceToDevice),"field copy");}
 void thc_gpu_resident::zero(const field& out){check(cudaMemsetAsync(data(out),0,entries(out)*sizeof(z)),"field zero");}
-thc_gpu_resident::field thc_gpu_resident::compress(const field& m,const field& response){
+thc_gpu_resident::field thc_gpu_resident::compress(const field& m,const field& response){return compress(m,response,field{});}
+thc_gpu_resident::field thc_gpu_resident::compress(const field& m,const field& response,const field& h){
   if(response.rows!=response.cols || m.rows!=response.rows)throw std::runtime_error("THC compression dimensions");
-  auto left=multiply_impl(m,response,'C','N',1.,_impl->auxiliary_gemm3m);
+  if(h.owner && (h.rows!=m.cols || h.cols!=m.rows || h.count!=m.count))throw std::runtime_error("THC packed M adjoint mismatch");
+  auto left=h.owner?multiply_impl(h,response,'N','N',1.,_impl->auxiliary_gemm3m):multiply_impl(m,response,'C','N',1.,_impl->auxiliary_gemm3m);
   return multiply_impl(left,m,'N','N',1.,_impl->auxiliary_gemm3m);
 }
-thc_gpu_resident::field thc_gpu_resident::expand(const field& m,const field& core){
+thc_gpu_resident::field thc_gpu_resident::expand(const field& m,const field& core){return expand(m,core,field{});}
+thc_gpu_resident::field thc_gpu_resident::expand(const field& m,const field& core,const field& h){
   if(core.rows!=core.cols || m.cols!=core.rows)throw std::runtime_error("THC expansion dimensions");
+  if(h.owner && (h.rows!=m.cols || h.cols!=m.rows || h.count!=m.count))throw std::runtime_error("THC packed M adjoint mismatch");
   auto left=multiply_impl(m,core,'N','N',1.,_impl->auxiliary_gemm3m);
-  return multiply_impl(left,m,'N','C',1.,_impl->auxiliary_gemm3m);
+  return h.owner?multiply_impl(left,h,'N','N',1.,_impl->auxiliary_gemm3m):multiply_impl(left,m,'N','C',1.,_impl->auxiliary_gemm3m);
 }
 thc_gpu_resident::field thc_gpu_resident::screen_core(const field& polarization){
   return solve_response(polarization,polarization);
@@ -300,6 +346,7 @@ void thc_gpu_resident::configure_momentum(size_t nk,size_t nq,size_t r,const std
   }
 }
 thc_gpu_resident::field thc_gpu_resident::correlate(const field& a,const field& b,bool sigma,bool transpose,size_t first,size_t count){
+  implementation::timer timer(*_impl,sigma?"sigma_convolution":"bubble_convolution");
   size_t nk=_impl->nk,r=_impl->rank;if(!count)count=_impl->nq;
   if(a.rows!=r || a.cols!=r || a.count!=nk || b.rows!=r || b.cols!=r || b.count!=(sigma?count:nk) || first>_impl->nq || count>_impl->nq-first)throw std::runtime_error("THC CUDA momentum field shape");
   if(!_impl->fft){auto result=allocate(r,r,sigma?nk:count);direct_correlation<<<grid(entries(result)),256>>>(data(result),data(a),data(b),static_cast<long*>(_impl->pairs->memory.pointer),
@@ -397,4 +444,13 @@ size_t thc_gpu_resident::peak_bytes()const{return _impl->pool->peak;}
 size_t thc_gpu_resident::host_transfer_calls()const{return _impl->copies;}
 size_t thc_gpu_resident::host_transfer_bytes()const{return _impl->bytes;}
 size_t thc_gpu_resident::fft_calls()const{return _impl->ffts;}
+std::map<std::string,double> thc_gpu_resident::component_seconds(){
+  if(_impl->profile_failed)throw std::runtime_error("THC CUDA profile event recording failed");
+  std::map<std::string,double> result;
+  for(auto& e:_impl->events){float ms=0;check(cudaEventSynchronize(e.end),"profile completion");
+    check(cudaEventElapsedTime(&ms,e.begin,e.end),"profile elapsed");result[e.name]+=double(ms)/1000;
+    check(cudaEventDestroy(e.begin),"profile event release");e.begin=nullptr;
+    check(cudaEventDestroy(e.end),"profile event release");e.end=nullptr;}
+  _impl->events.clear();return result;
+}
 }

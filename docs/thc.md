@@ -92,8 +92,8 @@ representation. These controls do not change the fitted factors or fit tolerance
   mesh values are preserved. Two-spin Sigma uses five FFT calls per tau instead
   of six. The complete Nt=110 example uses 880 rather than 990 calls, including
   the unchanged bubble stage. A one-point mesh needs no transforms.
-- `--thc_cpu_threads N` defaults to 1, allows 1..64, and bounds parallel Sigma
-  tau workers by the declared workspace. It applies to auxiliary/direct CPU GW
+- `--thc_cpu_threads N` defaults to 1, allows 1..64, and bounds parallel projection, bubble
+  and Sigma tau workers by the declared workspace. It applies to auxiliary/direct CPU GW
   with retained owned-q histories. Streaming falls back to one worker. Each worker
   writes disjoint tau slices; q accumulation order is preserved. Use one BLAS
   thread when testing these workers to avoid nested CPU oversubscription.
@@ -103,9 +103,25 @@ representation. These controls do not change the fitted factors or fit tolerance
   this option is incompatible with explicit orbital Sigma. Zero preserves the
   original per-spin point path. Benchmark the size for the intended dimensions.
 
-MBPT uses standard C++ threads scoped to the THC Sigma kernel. It does not
+MBPT uses standard C++ threads scoped to the THC GW kernel. It does not
 activate legacy OpenMP tensor loops. Worker code uses borrowed Eigen maps of
 buffers whose owners stay alive through every join; it avoids ndarray slice
 creation because GREEN v1.0.0 storage reference counting is non-atomic.
 Rebuild the coordinated
 symmetry, GPU and MBPT revisions together after changing resident APIs.
+
+The point-scaling branch adds optional `thc_profile` CUDA-event diagnostics and
+`thc_cuda_prepacked_adjoint`. Both default to false. The latter prepares X^H
+and M^H once per GW solve/q tile, replaces conjugate-transpose GEMM operands
+with equivalent normal operands, and includes those buffers in arena accounting
+and conservative tile estimates. Existing precision, screening and route
+defaults are unchanged. It also works with partial Sigma batches and FFT mode.
+The device probe covers complex rectangular matrices, tile tails and independent
+projection/compression/expansion/backprojection expressions.
+
+GPU diagnostics group GEMMs by transpose flags, dimensions and batch size, plus
+direct/FFT convolution intervals. They drain after each call. Profiling overhead
+must not be included in speedup comparisons. Prepacked adjoints gave essentially
+equal time in the initial rank-768 workstation comparison and remain optional.
+The orbital Sigma route uses DF-like quartic work under linear auxiliary growth;
+point Sigma is the route that preserves the cubic basis contraction order.

@@ -5,6 +5,7 @@
 #include <memory>
 #include <vector>
 #include <string>
+#include <map>
 
 namespace green::gpu {
   /** Stage-resident complex-double fields. Matrices are column-major on device;
@@ -23,7 +24,7 @@ namespace green::gpu {
     };
     // Gauss GEMM3M is an explicit, complex-double experiment limited to the
     // auxiliary compression/expansion helpers. All other GEMMs stay standard.
-    thc_gpu_resident(bool low_memory,size_t budget,bool auxiliary_gemm3m=false);
+    thc_gpu_resident(bool low_memory,size_t budget,bool auxiliary_gemm3m=false,bool profile=false);
     ~thc_gpu_resident();
     thc_gpu_resident(const thc_gpu_resident&)=delete;
     thc_gpu_resident& operator=(const thc_gpu_resident&)=delete;
@@ -33,7 +34,10 @@ namespace green::gpu {
     std::vector<matrix> download(const field& value);
     field multiply(const field& a,const field& b,char trans_a='N',char trans_b='N',double scale=1);
     field project(const field& x,const field& g);
+    field project(const field& x,const field& g,const field& packed_adjoint);
     field backproject(const field& x,const field& g,double scale=1);
+    field backproject(const field& x,const field& g,const field& packed_adjoint,double scale=1);
+    field adjoint(const field& value);
     field hadamard(const field& a,const field& b);
     field diagonal_sum(const field& a,double scale);
     field diagonal(const field& a);
@@ -41,7 +45,9 @@ namespace green::gpu {
     void copy(const field& destination,const field& source);
     void zero(const field& destination);
     field compress(const field& m,const field& response);
+    field compress(const field& m,const field& response,const field& packed_adjoint);
     field expand(const field& m,const field& core);
+    field expand(const field& m,const field& core,const field& packed_adjoint);
     field screen_core(const field& polarization);
     field screen(const field& m,const field& response,bool auxiliary);
     void configure_momentum(size_t nk,size_t nq,size_t rank,const std::vector<size_t>& transfer,
@@ -66,6 +72,7 @@ namespace green::gpu {
     size_t host_transfer_calls()const;
     size_t host_transfer_bytes()const;
     size_t fft_calls()const;
+    std::map<std::string,double> component_seconds();
   private:
     field multiply_impl(const field& a,const field& b,char trans_a,char trans_b,double scale,bool gemm3m);
     field solve_response(field polarization,field rhs);
