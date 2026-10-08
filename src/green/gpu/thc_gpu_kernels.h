@@ -109,12 +109,12 @@ namespace green::gpu {
       if(_fft){tensors::thc_momentum_fft layout(*_factors);}
       const double physical=2.*_ns*_nk*_nt*nao*nao+double(_nk)*r*nao+2.*_nt*_nw+double(r)*NQ;
       const double projection=(10.*_nk+8)*r*r+2.*_nk*r*nao;
-      const double screening=_auxiliary?double(_nw)*(2.*r*r+4.*r*NQ+7.*NQ*NQ)+double(_nt)*r*r:
-                                                        (7.*_nw+_nt)*r*r;
+      const double screening=_auxiliary?(7.*_nw+2.*_nt)*NQ*NQ:(7.*_nw+_nt)*r*r;
       const double fixed=physical+std::max(projection,screening)+2.*_nk*r*r+_nk*_nk+nq*_nk;
       const double available=double(_workspace_bytes)/16-fixed;
-      if(_nt%2 || available<double(_nt)*r*r)throw std::runtime_error("native THC GPU workspace budget cannot hold one q stage");
-      _tile_q=std::min(nq,size_t(available/(double(_nt)*r*r)));
+      const double per_q=_auxiliary?double(_nt)*NQ*NQ+3.*r*r+3.*r*NQ:double(_nt)*r*r;
+      if(_nt%2 || available<per_q)throw std::runtime_error("native THC GPU workspace budget cannot hold one q stage");
+      _tile_q=std::min(nq,size_t(available/per_q));
       if(_fft && _tile_q<nq)throw std::runtime_error("THC FFT all-q workspace exceeds declared budget; use direct or increase budget");
       if(!utils::context().global_rank)std::cout<<"Native THC resident CUDA GW: "<<(_fft?"batched cuFFT":"direct device sums")
         <<", screening "<<(_auxiliary?"auxiliary":"point")<<" dimension "<<(_auxiliary?NQ:r)<<", q tile "<<_tile_q<<std::endl;
@@ -151,34 +151,54 @@ namespace green::gpu {
         double bubble_seconds=0,screen_seconds=0,sigma_seconds=0;
         for(size_t first=0;first<nq;first+=_tile_q) {
           size_t count=std::min(_tile_q,nq-first);
-          auto chi=ops.allocate(r,r,count*_nt,true);
+          const size_t d=_auxiliary?_factors->naux():r;
+          auto chi=ops.allocate(d,d,count*_nt,true);
+          field cores;
+          if(_auxiliary){
+            std::vector<thc_gpu_resident::matrix> host_cores;
+            for(size_t q=first;q<first+count;++q)host_cores.emplace_back(_factors->M(q));
+            cores=ops.upload(host_cores);
+          }
           auto begin=now();
           for(size_t t=0;t<_nt/2;++t) {
+            field response;
+            if(_auxiliary)response=ops.allocate(r,r,count,true);
             for(size_t s=0;s<_ns;++s) {
               auto left=ops.project(x,green.slice(((_nt-t-1)*_ns+s)*_nk,_nk));
               auto right=ops.project(x,green.slice((t*_ns+s)*_nk,_nk));
               auto bubble=ops.correlate(left,right,false,true,first,count);
-              ops.accumulate_time(chi,bubble,t,_nt,-(_ns==2?1.:2.));
+              if(_auxiliary)ops.add(response,bubble,-(_ns==2?1.:2.));
+              else ops.accumulate_time(chi,bubble,t,_nt,-(_ns==2?1.:2.));
             }
-            ops.symmetrize_time(chi,t,_nt);
+            if(_auxiliary){
+              // M is time independent: compress once per mirrored half-tau pair.
+              ops.symmetrize(response);
+              auto projected_response=ops.compress(cores,response);
+              ops.accumulate_time(chi,projected_response,t,_nt,1.);
+              ops.mirror_time(chi,t,_nt);
+            }else ops.symmetrize_time(chi,t,_nt);
           }
           ops.finish_stage();bubble_seconds+=elapsed(begin);begin=now();
           for(size_t iq=0;iq<count;++iq) {
             size_t q=first+iq;auto tau=chi.slice(iq*_nt,_nt);
             if(!_fft && q%ctx.internode_size!=size_t(ctx.internode_rank)){ops.zero(tau);continue;}
-            auto m=ops.upload(thc_gpu_resident::matrix(_factors->M(q)));
-            auto frequency=ops.multiply(tau.reshape(r*r,_nt),forward_device).reshape(r,r,_nw);
-            auto wc=ops.screen(m,frequency,_auxiliary);
-            auto back=ops.multiply(wc.reshape(r*r,_nw),backward_device).reshape(r,r,_nt);
+            auto frequency=ops.multiply(tau.reshape(d*d,_nt),forward_device).reshape(d,d,_nw);
+            field wc;
+            if(_auxiliary)wc=ops.screen_core(frequency);
+            else {auto m=ops.upload(thc_gpu_resident::matrix(_factors->M(q)));wc=ops.screen(m,frequency,false);}
+            auto back=ops.multiply(wc.reshape(d*d,_nw),backward_device).reshape(d,d,_nt);
             ops.copy(tau,back);
           }
           ops.finish_stage();screen_seconds+=elapsed(begin);begin=now();
-          for(size_t t=0;t<_nt;++t)for(size_t s=0;s<_ns;++s) {
-            auto projected=ops.project(x,green.slice((t*_ns+s)*_nk,_nk));
-            auto wc=ops.time_slice(chi,t,_nt);
-            auto point_sigma=ops.correlate(projected,wc,true,false,first,count);
-            auto orbital=ops.backproject(x,point_sigma,-1.);
-            ops.add(result.slice((t*_ns+s)*_nk,_nk),orbital);
+          for(size_t t=0;t<_nt;++t) {
+            auto core=ops.time_slice(chi,t,_nt);
+            auto wc=_auxiliary?ops.expand(cores,core):core;
+            for(size_t s=0;s<_ns;++s) {
+              auto projected=ops.project(x,green.slice((t*_ns+s)*_nk,_nk));
+              auto point_sigma=ops.correlate(projected,wc,true,false,first,count);
+              auto orbital=ops.backproject(x,point_sigma,-1.);
+              ops.add(result.slice((t*_ns+s)*_nk,_nk),orbital);
+            }
           }
           ops.finish_stage();sigma_seconds+=elapsed(begin);
         }

@@ -96,6 +96,10 @@ namespace {
   __global__ void time_slice_kernel(z* out,const z* in,size_t count,size_t entries,size_t nt,size_t t) {
     size_t i=size_t(blockIdx.x)*blockDim.x+threadIdx.x;if(i<count*entries)out[i]=in[(i/entries*nt+t)*entries+i%entries];
   }
+  __global__ void mirror_time_kernel(z* out,size_t count,size_t entries,size_t nt,size_t t) {
+    size_t i=size_t(blockIdx.x)*blockDim.x+threadIdx.x;if(i<count*entries)
+      out[(i/entries*nt+nt-t-1)*entries+i%entries]=out[(i/entries*nt+t)*entries+i%entries];
+  }
   unsigned grid(size_t n){if((n+255)/256>size_t(std::numeric_limits<int>::max()))throw std::runtime_error("THC CUDA launch too large");return unsigned((n+255)/256);}
 }
 struct thc_gpu_resident::storage {
@@ -178,18 +182,36 @@ thc_gpu_resident::field thc_gpu_resident::diagonal(const field& a) {
 void thc_gpu_resident::add(const field& out,const field& value,double scale){same(out,value);z alpha=make_cuDoubleComplex(scale,0);check(cublasZaxpy(_impl->blas,dimension(entries(out)),&alpha,data(value),1,data(out),1),"accumulate");}
 void thc_gpu_resident::copy(const field& out,const field& value){same(out,value);check(cudaMemcpyAsync(data(out),data(value),entries(out)*sizeof(z),cudaMemcpyDeviceToDevice),"field copy");}
 void thc_gpu_resident::zero(const field& out){check(cudaMemsetAsync(data(out),0,entries(out)*sizeof(z)),"field zero");}
+thc_gpu_resident::field thc_gpu_resident::compress(const field& m,const field& response){
+  if(response.rows!=response.cols || m.rows!=response.rows)throw std::runtime_error("THC compression dimensions");
+  auto left=multiply(m,response,'C','N');return multiply(left,m);
+}
+thc_gpu_resident::field thc_gpu_resident::expand(const field& m,const field& core){
+  if(core.rows!=core.cols || m.cols!=core.rows)throw std::runtime_error("THC expansion dimensions");
+  auto left=multiply(m,core);return multiply(left,m,'N','C');
+}
+thc_gpu_resident::field thc_gpu_resident::screen_core(const field& polarization){
+  return solve_response(polarization,polarization);
+}
 thc_gpu_resident::field thc_gpu_resident::screen(const field& m,const field& response,bool auxiliary){
   if(m.count!=1 || response.rows!=response.cols || m.rows!=response.rows)throw std::runtime_error("THC screening dimensions");
-  size_t nw=response.count,n=auxiliary?m.cols:m.rows;field original,rhs,A;
-  if(auxiliary){auto left=multiply(m,response,'C','N');original=multiply(left,m);rhs=original;}
-  else {auto Z=multiply(m,m,'N','C');auto zr=multiply(Z,response);rhs=multiply(zr,Z);original=zr;}
-  A=allocate(n,n,nw);identity_minus<<<grid(entries(A)),256>>>(data(A),data(original),n,nw);check(cudaGetLastError(),"dielectric");
+  if(auxiliary)return expand(m,screen_core(compress(m,response)));
+  auto Z=multiply(m,m,'N','C'),original=multiply(Z,response),rhs=multiply(original,Z);
+  return solve_response(std::move(original),std::move(rhs));
+}
+thc_gpu_resident::field thc_gpu_resident::solve_response(field original,field rhs){
+  same(original,rhs);if(original.rows!=original.cols)throw std::runtime_error("THC dielectric dimensions");
+  const size_t n=original.rows,nw=original.count;
+  auto A=allocate(n,n,nw);identity_minus<<<grid(entries(A)),256>>>(data(A),data(original),n,nw);check(cudaGetLastError(),"dielectric");
   original={};
   auto lu=allocate(n,n,nw),solution=allocate(n,n,nw);copy(lu,A);copy(solution,rhs);
   auto info=std::make_shared<storage>(_impl->pool,2*nw*sizeof(int));
   check(cudaMemsetAsync(info->memory.pointer,0,2*nw*sizeof(int)),"solve status zero");
   auto piv=std::make_shared<storage>(_impl->pool,n*nw*sizeof(int));
-  if(n<=32){
+  // Batch medium dielectric systems when enough frequencies amortize setup.
+  // The workstation probe measures 64/150/192/256 with 107 frequencies;
+  // keep cuSOLVER for large systems and small nontrivial batches.
+  if(n<=32 || (n<=256 && nw>=32)){
     auto aa=std::make_shared<storage>(_impl->pool,nw*sizeof(z*)),bb=std::make_shared<storage>(_impl->pool,nw*sizeof(z*));
     pointers<<<grid(nw),256>>>(static_cast<z**>(aa->memory.pointer),static_cast<z**>(bb->memory.pointer),data(lu),data(solution),n*n,nw);
     check(cudaGetLastError(),"batched solve pointers");
@@ -217,7 +239,6 @@ thc_gpu_resident::field thc_gpu_resident::screen(const field& m,const field& res
   residual_norm<<<dimension(nw),256>>>(data(residual),data(rhs),static_cast<double*>(norms->memory.pointer),n*n);check(cudaGetLastError(),"screening residual");
   std::vector<double> errors(nw);check(cudaMemcpy(errors.data(),norms->memory.pointer,nw*sizeof(double),cudaMemcpyDeviceToHost),"residual status");++_impl->copies;_impl->bytes+=nw*sizeof(double);
   for(double e:errors)if(!std::isfinite(e) || e>1e-9)throw std::runtime_error("native THC CUDA screening residual failed");
-  if(auxiliary){A={};rhs={};residual={};auto first=multiply(m,solution);return multiply(first,m,'N','C');}
   return solution;
 }
 void thc_gpu_resident::configure_momentum(size_t nk,size_t nq,size_t r,const std::vector<size_t>& transfer,
@@ -258,6 +279,14 @@ void thc_gpu_resident::accumulate_time(const field& out,const field& value,size_
 void thc_gpu_resident::symmetrize_time(const field& out,size_t t,size_t nt){
   if(out.rows!=out.cols || out.count%nt || t>=nt/2)throw std::runtime_error("THC time symmetrization shape");
   symmetrize_time_kernel<<<grid(out.count/nt*out.rows*out.cols),256>>>(data(out),out.count/nt,out.rows,nt,t);check(cudaGetLastError(),"time symmetry");
+}
+void thc_gpu_resident::symmetrize(const field& out){
+  if(out.rows!=out.cols)throw std::runtime_error("THC symmetry shape");
+  symmetrize_time_kernel<<<grid(entries(out)),256>>>(data(out),out.count,out.rows,1,0);check(cudaGetLastError(),"matrix symmetry");
+}
+void thc_gpu_resident::mirror_time(const field& out,size_t t,size_t nt){
+  if(!nt || out.count%nt || t>=nt/2)throw std::runtime_error("THC time mirror shape");
+  mirror_time_kernel<<<grid(out.count/nt*out.rows*out.cols),256>>>(data(out),out.count/nt,out.rows*out.cols,nt,t);check(cudaGetLastError(),"time mirror");
 }
 thc_gpu_resident::field thc_gpu_resident::time_slice(const field& in,size_t t,size_t nt){
   if(in.count%nt || t>=nt)throw std::runtime_error("THC time slice shape");auto out=allocate(in.rows,in.cols,in.count/nt);

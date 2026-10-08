@@ -38,6 +38,9 @@ namespace green::gpu {
     void add(const field& destination,const field& source,double scale=1);
     void copy(const field& destination,const field& source);
     void zero(const field& destination);
+    field compress(const field& m,const field& response);
+    field expand(const field& m,const field& core);
+    field screen_core(const field& polarization);
     field screen(const field& m,const field& response,bool auxiliary);
     void configure_momentum(size_t nk,size_t nq,size_t rank,const std::vector<size_t>& transfer,
                             const std::vector<double>& k,const std::vector<double>& q,bool fft);
@@ -45,6 +48,8 @@ namespace green::gpu {
                     size_t first_q=0,size_t number_q=0);
     void accumulate_time(const field& destination,const field& source,size_t t,size_t nt,double scale);
     void symmetrize_time(const field& destination,size_t t,size_t nt);
+    void symmetrize(const field& destination);
+    void mirror_time(const field& destination,size_t t,size_t nt);
     field time_slice(const field& source,size_t t,size_t nt);
     void finish_stage();
     void synchronize();
@@ -54,6 +59,7 @@ namespace green::gpu {
     size_t host_transfer_calls()const;
     size_t host_transfer_bytes()const;
   private:
+    field solve_response(field polarization,field rhs);
     struct implementation;
     std::unique_ptr<implementation> _impl;
   };

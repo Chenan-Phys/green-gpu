@@ -1,6 +1,6 @@
 # GPU THC modes
 
-Use the coordinated `feature/thc-performance` revisions of green-symmetry,
+Use the coordinated `feature/thc-contraction-order` revisions of green-symmetry,
 green-gpu and green-mbpt. DF remains the default; select it explicitly with
 `--interaction_representation df`. Select THC with
 `--interaction_representation thc --thc_mode reconstruct|native`.
@@ -23,14 +23,23 @@ fallback. The projection cache is reused across every q in a tile.
 auxiliary space when Q < interpolation rank, otherwise point space. With
 `Z=M M^H`, the auxiliary calculation is exactly
 `P=M^H chi M; (I-P) C=P; Wc=M C M^H`. It introduces no fit or rank truncation.
-Small systems use batched cuBLAS LU; larger systems reuse one cuSOLVER workspace
-across frequencies. Both paths check solver status and residuals.
+Auxiliary mode compresses the summed-spin bubble in the mirrored half of tau,
+then applies the original IR transforms to Q-by-Q matrices. It solves for C in
+frequency and retains C in tau; Wc is expanded once per current tau and reused
+across spins. M is independent of tau, so moving it across these linear
+transforms preserves the same fitted interaction. The q-dependent M stays
+outside momentum transforms. Point mode retains its original ordering.
+Systems up to dimension 32 use batched cuBLAS LU. Dimensions up to 256 also
+use batching when there are at least 32 frequencies, based on workstation
+microbenchmarks. Other systems reuse one cuSOLVER workspace across frequencies.
+Both paths check factorization status, solve status, and residuals.
 
 `--thc_gw_k_contraction direct|fft` defaults to direct. FFT uses cached batched
 cuFFT plans on complete Cartesian commensurate meshes. The shared mesh mapper
 preserves shifted cosets and shuffled k/q ordering. Complex correlations use
 the negative Fourier index without conjugating the second field. Length-one
-momentum transforms reduce to identity. FFT retains all-q response/Wc arrays;
+momentum transforms reduce to identity. FFT retains all-q histories in the
+selected screening space (Q-by-Q auxiliary cores or point-space matrices);
 insufficient declared workspace rejects with a direct-mode alternative.
 
 `thc_workspace_mb` caps owned device buffers, including explicit cuFFT workspace.
