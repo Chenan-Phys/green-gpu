@@ -100,6 +100,25 @@ namespace {
     size_t i=size_t(blockIdx.x)*blockDim.x+threadIdx.x;if(i<count*entries)
       out[(i/entries*nt+nt-t-1)*entries+i%entries]=out[(i/entries*nt+t)*entries+i%entries];
   }
+  __global__ void repeat_kernel(z* out,const z* in,size_t size,size_t original) {
+    const size_t i=size_t(blockIdx.x)*blockDim.x+threadIdx.x;if(i<size)out[i]=in[i%original];
+  }
+  __global__ void orbital_pair_kernel(z* out,const z* x,const long* pairs,size_t nk,size_t r,size_t n,size_t q) {
+    const size_t id=size_t(blockIdx.x)*blockDim.x+threadIdx.x;if(id>=nk*n*n*r)return;
+    const size_t k=id/(n*n*r),e=id%(n*n*r),p=e/(n*n),a=e%n,i=(e/n)%n;
+    const long kp=pairs[q*nk+k];
+    out[id]=kp<0?make_cuDoubleComplex(0,0):cuCmul(cuConj(x[k*r*n+p+a*r]),x[size_t(kp)*r*n+p+i*r]);
+  }
+  __global__ void orbital_pack_kernel(z* out,const z* in,size_t nk,size_t n,size_t Q,bool stack) {
+    const size_t id=size_t(blockIdx.x)*blockDim.x+threadIdx.x;if(id>=nk*n*n*Q)return;
+    const size_t k=id/(n*n*Q),e=id%(n*n*Q),a=e%n,i=(e/n)%n,A=e/(n*n);
+    const size_t packed=k*n*n*Q+a+A*n+i*n*Q;
+    if(stack)out[packed]=in[id];else out[id]=in[packed];
+  }
+  __global__ void orbital_green_kernel(z* out,const z* in,const long* pairs,size_t nk,size_t n,size_t q) {
+    const size_t id=size_t(blockIdx.x)*blockDim.x+threadIdx.x;if(id>=nk*n*n)return;
+    const long kp=pairs[q*nk+id/(n*n)];out[id]=kp<0?make_cuDoubleComplex(0,0):in[size_t(kp)*n*n+id%(n*n)];
+  }
   unsigned grid(size_t n){if((n+255)/256>size_t(std::numeric_limits<int>::max()))throw std::runtime_error("THC CUDA launch too large");return unsigned((n+255)/256);}
 }
 struct thc_gpu_resident::storage {
@@ -124,7 +143,7 @@ struct thc_gpu_resident::implementation {
   std::shared_ptr<arena> pool;bool low,fft=false,auxiliary_gemm3m=false;cublasHandle_t blas=nullptr;cusolverDnHandle_t solver=nullptr;
   cufftHandle plan=0;std::shared_ptr<storage> fft_work;
   std::shared_ptr<storage> transfer,pairs,kmap,qmap,negative;
-  size_t nk=0,nq=0,rank=0,gemms=0,solves=0,copies=0,bytes=0;
+  size_t nk=0,nq=0,rank=0,gemms=0,solves=0,copies=0,bytes=0,ffts=0;
   implementation(bool l,size_t b,bool gemm3m):pool(std::make_shared<arena>(b)),low(l),auxiliary_gemm3m(gemm3m){
     try {
       check(cudaSetDevice(0),"device");
@@ -290,10 +309,65 @@ thc_gpu_resident::field thc_gpu_resident::correlate(const field& a,const field& 
   reorder<<<grid(entries(left)),256>>>(data(left),data(a),static_cast<size_t*>(_impl->kmap->memory.pointer),nk,r,transpose,false,1);
   reorder<<<grid(entries(right)),256>>>(data(right),data(b),static_cast<size_t*>((sigma?_impl->qmap:_impl->kmap)->memory.pointer),nk,r,false,false,1);
   check(cudaGetLastError(),"FFT packing");check(cufftExecZ2Z(_impl->plan,data(left),data(left),CUFFT_FORWARD),"left FFT");check(cufftExecZ2Z(_impl->plan,data(right),data(right),CUFFT_FORWARD),"right FFT");
+  _impl->ffts+=2;
   auto product=allocate(r,r,nk);
   fourier_product<<<grid(entries(product)),256>>>(data(product),data(left),data(right),static_cast<size_t*>(_impl->negative->memory.pointer),nk,r*r);check(cudaGetLastError(),"Fourier correlation");
   check(cufftExecZ2Z(_impl->plan,data(product),data(product),CUFFT_INVERSE),"inverse FFT");
+  ++_impl->ffts;
   auto result=allocate(r,r,nk);reorder<<<grid(entries(result)),256>>>(data(result),data(product),static_cast<size_t*>((sigma?_impl->kmap:_impl->qmap)->memory.pointer),nk,r,false,true,1./nk);check(cudaGetLastError(),"FFT unpacking");return result;
+}
+thc_gpu_resident::field thc_gpu_resident::prepare_sigma_right(const field& b){
+  const size_t nk=_impl->nk,r=_impl->rank;
+  if(b.rows!=r || b.cols!=r)throw std::runtime_error("THC prepared screening shape");
+  if(!_impl->fft)return b;
+  if(b.count!=nk)throw std::runtime_error("THC prepared screening needs all q");
+  auto right=allocate(r,r,nk);
+  reorder<<<grid(entries(right)),256>>>(data(right),data(b),static_cast<size_t*>(_impl->qmap->memory.pointer),nk,r,false,false,1);
+  check(cudaGetLastError(),"screening FFT packing");
+  check(cufftExecZ2Z(_impl->plan,data(right),data(right),CUFFT_FORWARD),"shared screening FFT");++_impl->ffts;
+  return right;
+}
+thc_gpu_resident::field thc_gpu_resident::correlate_sigma_prepared(const field& a,const field& right,size_t first,size_t count){
+  if(!_impl->fft)return correlate(a,right,true,false,first,count);
+  const size_t nk=_impl->nk,r=_impl->rank;if(!count)count=_impl->nq;
+  if(first || count!=nk || a.rows!=r || a.cols!=r || a.count!=nk || right.rows!=r || right.cols!=r || right.count!=nk)
+    throw std::runtime_error("THC prepared Sigma correlation shape");
+  auto left=allocate(r,r,nk);
+  reorder<<<grid(entries(left)),256>>>(data(left),data(a),static_cast<size_t*>(_impl->kmap->memory.pointer),nk,r,false,false,1);
+  check(cudaGetLastError(),"prepared Sigma packing");
+  check(cufftExecZ2Z(_impl->plan,data(left),data(left),CUFFT_FORWARD),"prepared Sigma left FFT");++_impl->ffts;
+  auto product=allocate(r,r,nk);
+  fourier_product<<<grid(entries(product)),256>>>(data(product),data(left),data(right),static_cast<size_t*>(_impl->negative->memory.pointer),nk,r*r);
+  check(cudaGetLastError(),"prepared Sigma product");
+  check(cufftExecZ2Z(_impl->plan,data(product),data(product),CUFFT_INVERSE),"prepared Sigma inverse FFT");++_impl->ffts;
+  auto result=allocate(r,r,nk);
+  reorder<<<grid(entries(result)),256>>>(data(result),data(product),static_cast<size_t*>(_impl->kmap->memory.pointer),nk,r,false,true,1./nk);
+  check(cudaGetLastError(),"prepared Sigma unpacking");return result;
+}
+thc_gpu_resident::field thc_gpu_resident::repeat(const field& in,size_t times){
+  if(!times)throw std::runtime_error("THC zero field repetitions");
+  auto out=allocate(in.rows,in.cols,product(in.count,times));
+  repeat_kernel<<<grid(entries(out)),256>>>(data(out),data(in),entries(out),entries(in));check(cudaGetLastError(),"field repeat");return out;
+}
+thc_gpu_resident::field thc_gpu_resident::orbital_vertices(const field& x,const field& m,size_t q){
+  const size_t nk=_impl->nk,r=_impl->rank,n=x.cols;
+  if(x.rows!=r || x.count!=nk || m.rows!=r || m.count!=1 || q>=_impl->nq)throw std::runtime_error("THC orbital vertices shape");
+  auto pairs=allocate(n*n,r,nk);
+  orbital_pair_kernel<<<grid(entries(pairs)),256>>>(data(pairs),data(x),static_cast<long*>(_impl->pairs->memory.pointer),nk,r,n,q);
+  check(cudaGetLastError(),"orbital pair packing");return multiply(pairs,m);
+}
+thc_gpu_resident::field thc_gpu_resident::orbital_sigma(const field& v,const field& weighted,const field& g,size_t q,double scale){
+  const size_t nk=_impl->nk,n=g.rows,Q=v.cols;
+  if(g.cols!=n || g.count!=nk || v.rows!=n*n || v.count!=nk || q>=_impl->nq)throw std::runtime_error("THC orbital Sigma shape");
+  same(v,weighted);
+  auto stacked=allocate(n*Q,n,nk),paired=allocate(n,n,nk);
+  orbital_pack_kernel<<<grid(entries(stacked)),256>>>(data(stacked),data(weighted),nk,n,Q,true);
+  orbital_green_kernel<<<grid(entries(paired)),256>>>(data(paired),data(g),static_cast<long*>(_impl->pairs->memory.pointer),nk,n,q);
+  check(cudaGetLastError(),"orbital Sigma packing");
+  auto first=multiply(stacked,paired),horizontal=allocate(n,n*Q,nk);
+  orbital_pack_kernel<<<grid(entries(horizontal)),256>>>(data(horizontal),data(first),nk,n,Q,false);
+  check(cudaGetLastError(),"orbital Sigma unpacking");
+  return multiply(horizontal,v.reshape(n,n*Q,nk),'N','C',scale);
 }
 void thc_gpu_resident::accumulate_time(const field& out,const field& value,size_t t,size_t nt,double scale){
   if(out.rows!=value.rows || out.cols!=value.cols || out.count!=value.count*nt || t>=nt)throw std::runtime_error("THC time accumulation shape");
@@ -322,4 +396,5 @@ size_t thc_gpu_resident::solve_calls()const{return _impl->solves;}
 size_t thc_gpu_resident::peak_bytes()const{return _impl->pool->peak;}
 size_t thc_gpu_resident::host_transfer_calls()const{return _impl->copies;}
 size_t thc_gpu_resident::host_transfer_bytes()const{return _impl->bytes;}
+size_t thc_gpu_resident::fft_calls()const{return _impl->ffts;}
 }

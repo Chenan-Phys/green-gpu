@@ -67,3 +67,44 @@ with reconstruction executes GPU HF plus CPU GF2 correlation.
 Printed counters report owned peak bytes, host transfer calls/bytes, GEMMs,
 LU solves and synchronized GW stage times. Performance depends on rank, Q,
 basis, mesh and requested accuracy; retain the DF choice when it is faster.
+
+
+## Sigma contraction and execution controls
+
+The `feature/thc-sigma-optimization` branch adds exact complex-double execution
+alternatives for native scalar, full-BZ GW. DF remains the default interaction
+representation. These controls do not change the fitted factors or fit tolerances.
+
+- `--thc_gw_sigma point|orbital|auto` defaults to `point`. `orbital` requires
+  auxiliary screening and direct momentum sums. It constructs fixed vertices
+  `V[k,kp,A,a,i] = sum_p conj(X[k,p,a])*X[kp,p,i]*M[q,p,A]`, then contracts
+  `Sigma[k] -= sum_(kp,A,B) V_A G[kp] V_B^H C[q,A,B]/Nk`. The screened core `C`
+  stays in Q space; Sigma never expands it into a point matrix. The CPU and GPU
+  layouts differ internally and are tested against independent point expressions.
+  The cache scales as `Nk*Nq*n*n*Q` complex values and can be reused across solver
+  iterations. Cold-run timings include its construction. `auto` uses a conservative
+  cached-point operation estimate with a 10% margin, not a timing guarantee.
+  In unsupported momentum/screening modes it selects `point`. GPU auto also
+  selects point when vertex workspace does not fit or a tau batch is requested.
+- `--thc_fft_reuse_screening true|false` defaults to `true`. In momentum FFT mode
+  it transforms the screened interaction once per tau and shares it across spins.
+  The original non-conjugating correlation, negative-frequency mapping and shifted
+  mesh values are preserved. Two-spin Sigma uses five FFT calls per tau instead
+  of six. The complete Nt=110 example uses 880 rather than 990 calls, including
+  the unchanged bubble stage. A one-point mesh needs no transforms.
+- `--thc_cpu_threads N` defaults to 1, allows 1..64, and bounds parallel Sigma
+  tau workers by the declared workspace. It applies to auxiliary/direct CPU GW
+  with retained owned-q histories. Streaming falls back to one worker. Each worker
+  writes disjoint tau slices; q accumulation order is preserved. Use one BLAS
+  thread when testing these workers to avoid nested CPU oversubscription.
+- `--thc_cuda_sigma_batch N` defaults to 0. Values 1..32 batch point-space
+  projection/backprojection over spins and up to N adjacent tau slices. A final
+  partial tile is supported. Extra projected/point fields consume workspace;
+  this option is incompatible with explicit orbital Sigma. Zero preserves the
+  original per-spin point path. Benchmark the size for the intended dimensions.
+
+MBPT enables OpenMP when available with `GREEN_THC_OPENMP=ON` (default). Set it
+OFF for a serial build; requesting CPU workers above one then produces an error.
+A pre-existing GF2 tau loop was rewritten with one induction variable to make it
+valid OpenMP syntax, preserving all original tau indices. Rebuild the coordinated
+symmetry, GPU and MBPT revisions together after changing resident APIs.

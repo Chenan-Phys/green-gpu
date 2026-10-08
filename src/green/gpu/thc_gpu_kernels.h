@@ -6,6 +6,7 @@
 #include <green/grids/transformer_t.h>
 #include <green/integrals/thc_factor_data.h>
 #include <green/tensors/thc_gw_fft.h>
+#include <green/tensors/thc_sigma_orbital.h>
 #include <chrono>
 
 namespace green::gpu {
@@ -88,12 +89,14 @@ namespace green::gpu {
   };
   class thc_gw_gpu_kernel {
     size_t _ns,_nk,_nt,_nw,_tile_q=0;
-    bool _fft=false,_auxiliary=false;
+    bool _fft=false,_auxiliary=false,_orbital=false,_reuse_fft=true;
+    size_t _sigma_batch=0;
     size_t _workspace_bytes=0;
     std::string _screening;
     const grids::transformer_t& _ft;
     std::shared_ptr<integrals::thc_factor_data> _factors;
     std::unique_ptr<thc_gpu_resident> _ops;
+    std::vector<thc_gpu_resident::field> _vertices;
   public:
     using G_type=utils::shared_object<ztensor<5>>;
     thc_gw_gpu_kernel(const params::params& p,size_t nao,size_t ns,size_t NQ,
@@ -105,12 +108,22 @@ namespace green::gpu {
       _fft=p["thc_gw_k_contraction"].as<std::string>()=="fft";
       _screening=p["thc_gw_screening"].as<std::string>();
       _auxiliary=tensors::thc_auxiliary_screening(_screening,r,NQ);
+      _sigma_batch=p["thc_cuda_sigma_batch"].as<size_t>();
+      if(_sigma_batch>32)throw std::runtime_error("thc_cuda_sigma_batch must be in 0..32");
+      const auto sigma_choice=p["thc_gw_sigma"].as<std::string>();
+      _orbital=tensors::thc_sigma_orbital(sigma_choice,nao,r,NQ,_nk,_ns,_auxiliary,!_fft && !_sigma_batch);
+      _reuse_fft=p["thc_fft_reuse_screening"].as<bool>();
       _workspace_bytes=p["thc_workspace_mb"].as<size_t>()*1024*1024;
       if(_fft){tensors::thc_momentum_fft layout(*_factors);}
       const double physical=2.*_ns*_nk*_nt*nao*nao+double(_nk)*r*nao+2.*_nt*_nw+double(r)*NQ;
       const double projection=(10.*_nk+8)*r*r+2.*_nk*r*nao;
       const double screening=_auxiliary?(7.*_nw+2.*_nt)*NQ*NQ:(7.*_nw+_nt)*r*r;
-      const double fixed=physical+std::max(projection,screening)+2.*_nk*r*r+_nk*_nk+nq*_nk;
+      const double orbital_extra=double(_nk)*nq*nao*nao*NQ+double(_nk)*nao*nao*(r+6.*NQ);
+      const double batch_extra=_sigma_batch?2.*(_sigma_batch*_ns-1)*_nk*r*r+double(_sigma_batch)*_ns*_nk*r*nao:0.;
+      const double original_fixed=physical+std::max(projection,screening)+2.*_nk*r*r+_nk*_nk+nq*_nk;
+      const double minimum_q=_auxiliary?double(_nt)*NQ*NQ+3.*r*r+3.*r*NQ:double(_nt)*r*r;
+      if(sigma_choice=="auto" && _orbital && original_fixed+orbital_extra+minimum_q>double(_workspace_bytes)/16)_orbital=false;
+      const double fixed=original_fixed+(_orbital?orbital_extra:batch_extra);
       const double available=double(_workspace_bytes)/16-fixed;
       const double per_q=_auxiliary?double(_nt)*NQ*NQ+3.*r*r+3.*r*NQ:double(_nt)*r*r;
       if(_nt%2 || available<per_q)throw std::runtime_error("native THC GPU workspace budget cannot hold one q stage");
@@ -118,12 +131,14 @@ namespace green::gpu {
       if(_fft && _tile_q<nq)throw std::runtime_error("THC FFT all-q workspace exceeds declared budget; use direct or increase budget");
       if(!utils::context().global_rank)std::cout<<"Native THC resident CUDA GW: "<<(_fft?"batched cuFFT":"direct device sums")
         <<", screening "<<(_auxiliary?"auxiliary":"point")<<" dimension "<<(_auxiliary?NQ:r)<<", q tile "<<_tile_q
+        <<", Sigma route "<<(_orbital?"orbital":"point")<<", Sigma tau batch "<<_sigma_batch<<", screening FFT shared "<<_reuse_fft
         <<", auxiliary GEMM "<<(p["thc_cuda_aux_gemm3m"].as<bool>()?"GEMM3M (explicit)":"standard")<<std::endl;
       if(!utils::context().node_rank) {
         _ops=std::make_unique<thc_gpu_resident>(p["cuda_low_gpu_memory"].as<bool>(),_workspace_bytes,p["thc_cuda_aux_gemm3m"].as<bool>());
         std::vector<size_t> transfer(_nk*_nk);
         for(size_t k=0;k<_nk;++k)for(size_t kp=0;kp<_nk;++kp)transfer[k*_nk+kp]=_factors->transfer(k,kp);
         _ops->configure_momentum(_nk,nq,r,transfer,_factors->kmesh_scaled(),_factors->qmesh_scaled(),_fft);
+        _vertices.resize(nq);
       }
     }
     void solve(G_type& g,G_type& sigma) {
@@ -147,6 +162,7 @@ namespace green::gpu {
         forward.block(1,0,_ft.Tnt_BF().cols(),_nw)=_ft.Tnt_BF().transpose();
         auto forward_device=ops.upload(forward);
         auto backward_device=ops.upload(thc_gpu_resident::matrix(_ft.Ttn_FB().transpose()));
+        field batch_x;if(_sigma_batch)batch_x=ops.repeat(x,_sigma_batch*_ns);
         auto now=[](){return std::chrono::steady_clock::now();};
         auto elapsed=[&](auto begin){return std::chrono::duration<double>(now()-begin).count();};
         double bubble_seconds=0,screen_seconds=0,sigma_seconds=0;
@@ -191,14 +207,50 @@ namespace green::gpu {
             ops.copy(tau,back);
           }
           ops.finish_stage();screen_seconds+=elapsed(begin);begin=now();
-          for(size_t t=0;t<_nt;++t) {
-            auto core=ops.time_slice(chi,t,_nt);
-            auto wc=_auxiliary?ops.expand(cores,core):core;
-            for(size_t s=0;s<_ns;++s) {
-              auto projected=ops.project(x,green.slice((t*_ns+s)*_nk,_nk));
-              auto point_sigma=ops.correlate(projected,wc,true,false,first,count);
-              auto orbital=ops.backproject(x,point_sigma,-1.);
-              ops.add(result.slice((t*_ns+s)*_nk,_nk),orbital);
+          if(_orbital) {
+            for(size_t iq=0;iq<count;++iq) {
+              const size_t q=first+iq;if(q%ctx.internode_size!=size_t(ctx.internode_rank))continue;
+              if(!_vertices[q].owner)_vertices[q]=ops.orbital_vertices(x,cores.slice(iq),q);
+            }
+            for(size_t t=0;t<_nt;++t) {
+              auto core=ops.time_slice(chi,t,_nt);
+              for(size_t iq=0;iq<count;++iq) {
+                const size_t q=first+iq;if(q%ctx.internode_size!=size_t(ctx.internode_rank))continue;
+                auto weighted=ops.multiply(_vertices[q],core.slice(iq));
+                for(size_t s=0;s<_ns;++s) {
+                  auto orbital=ops.orbital_sigma(_vertices[q],weighted,green.slice((t*_ns+s)*_nk,_nk),q,-1./_nk);
+                  ops.add(result.slice((t*_ns+s)*_nk,_nk),orbital);
+                }
+              }
+            }
+          } else if(_sigma_batch) {
+            for(size_t start=0;start<_nt;start+=_sigma_batch) {
+              const size_t times=std::min(_sigma_batch,_nt-start),batches=times*_ns*_nk;
+              auto bx=batch_x.slice(0,batches);
+              auto projected=ops.project(bx,green.slice(start*_ns*_nk,batches));
+              auto point_sigma=ops.allocate(r,r,batches);
+              for(size_t it=0;it<times;++it) {
+                auto core=ops.time_slice(chi,start+it,_nt),wc=_auxiliary?ops.expand(cores,core):core;
+                field prepared;if(_fft && _reuse_fft){prepared=ops.prepare_sigma_right(wc);wc=field{};}
+                for(size_t s=0;s<_ns;++s) {
+                  auto pg=projected.slice((it*_ns+s)*_nk,_nk);
+                  auto point=prepared.owner?ops.correlate_sigma_prepared(pg,prepared,first,count):ops.correlate(pg,wc,true,false,first,count);
+                  ops.copy(point_sigma.slice((it*_ns+s)*_nk,_nk),point);
+                }
+              }
+              auto orbital=ops.backproject(bx,point_sigma,-1.);
+              ops.add(result.slice(start*_ns*_nk,batches),orbital);
+            }
+          } else {
+            for(size_t t=0;t<_nt;++t) {
+              auto core=ops.time_slice(chi,t,_nt),wc=_auxiliary?ops.expand(cores,core):core;
+              field prepared;if(_fft && _reuse_fft){prepared=ops.prepare_sigma_right(wc);wc=field{};}
+              for(size_t s=0;s<_ns;++s) {
+                auto projected=ops.project(x,green.slice((t*_ns+s)*_nk,_nk));
+                auto point_sigma=prepared.owner?ops.correlate_sigma_prepared(projected,prepared,first,count):ops.correlate(projected,wc,true,false,first,count);
+                auto orbital=ops.backproject(x,point_sigma,-1.);
+                ops.add(result.slice((t*_ns+s)*_nk,_nk),orbital);
+              }
             }
           }
           ops.finish_stage();sigma_seconds+=elapsed(begin);
@@ -209,7 +261,7 @@ namespace green::gpu {
         if(!ctx.global_rank)std::cout<<"Native THC resident CUDA GEMMs="<<ops.gemm_calls()<<", LU solves="<<ops.solve_calls()
           <<", owned peak bytes="<<ops.peak_bytes()<<", host transfer calls="<<ops.host_transfer_calls()
           <<", host transfer bytes="<<ops.host_transfer_bytes()<<", bubble_seconds="<<bubble_seconds
-          <<", screen_seconds="<<screen_seconds<<", sigma_seconds="<<sigma_seconds<<std::endl;
+          <<", screen_seconds="<<screen_seconds<<", sigma_seconds="<<sigma_seconds<<", FFT calls="<<ops.fft_calls()<<std::endl;
       }
       if(!ctx.node_rank)utils::allreduce(MPI_IN_PLACE,sigma.object().data(),sigma.object().size(),MPI_C_DOUBLE_COMPLEX,MPI_SUM,ctx.internode_comm);
       sigma.fence();

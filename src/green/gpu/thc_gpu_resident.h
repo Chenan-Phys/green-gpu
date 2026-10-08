@@ -53,6 +53,11 @@ namespace green::gpu {
     void symmetrize(const field& destination);
     void mirror_time(const field& destination,size_t t,size_t nt);
     field time_slice(const field& source,size_t t,size_t nt);
+    field repeat(const field& source,size_t repetitions);
+    field orbital_vertices(const field& x,const field& m,size_t q);
+    field orbital_sigma(const field& vertices,const field& weighted,const field& g,size_t q,double scale=1);
+    field prepare_sigma_right(const field& screened);
+    field correlate_sigma_prepared(const field& projected,const field& prepared,size_t first_q=0,size_t number_q=0);
     void finish_stage();
     void synchronize();
     size_t gemm_calls()const;
@@ -60,6 +65,7 @@ namespace green::gpu {
     size_t peak_bytes()const;
     size_t host_transfer_calls()const;
     size_t host_transfer_bytes()const;
+    size_t fft_calls()const;
   private:
     field multiply_impl(const field& a,const field& b,char trans_a,char trans_b,double scale,bool gemm3m);
     field solve_response(field polarization,field rhs);
