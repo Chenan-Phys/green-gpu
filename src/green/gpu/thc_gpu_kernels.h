@@ -117,9 +117,10 @@ namespace green::gpu {
       _tile_q=std::min(nq,size_t(available/per_q));
       if(_fft && _tile_q<nq)throw std::runtime_error("THC FFT all-q workspace exceeds declared budget; use direct or increase budget");
       if(!utils::context().global_rank)std::cout<<"Native THC resident CUDA GW: "<<(_fft?"batched cuFFT":"direct device sums")
-        <<", screening "<<(_auxiliary?"auxiliary":"point")<<" dimension "<<(_auxiliary?NQ:r)<<", q tile "<<_tile_q<<std::endl;
+        <<", screening "<<(_auxiliary?"auxiliary":"point")<<" dimension "<<(_auxiliary?NQ:r)<<", q tile "<<_tile_q
+        <<", auxiliary GEMM "<<(p["thc_cuda_aux_gemm3m"].as<bool>()?"GEMM3M (explicit)":"standard")<<std::endl;
       if(!utils::context().node_rank) {
-        _ops=std::make_unique<thc_gpu_resident>(p["cuda_low_gpu_memory"].as<bool>(),_workspace_bytes);
+        _ops=std::make_unique<thc_gpu_resident>(p["cuda_low_gpu_memory"].as<bool>(),_workspace_bytes,p["thc_cuda_aux_gemm3m"].as<bool>());
         std::vector<size_t> transfer(_nk*_nk);
         for(size_t k=0;k<_nk;++k)for(size_t kp=0;kp<_nk;++kp)transfer[k*_nk+kp]=_factors->transfer(k,kp);
         _ops->configure_momentum(_nk,nq,r,transfer,_factors->kmesh_scaled(),_factors->qmesh_scaled(),_fft);

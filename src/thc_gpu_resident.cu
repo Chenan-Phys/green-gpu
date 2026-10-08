@@ -121,13 +121,18 @@ thc_gpu_resident::field thc_gpu_resident::field::reshape(size_t r,size_t c,size_
   field result=*this;result.rows=r;result.cols=c;result.count=batches;return result;
 }
 struct thc_gpu_resident::implementation {
-  std::shared_ptr<arena> pool;bool low,fft=false;cublasHandle_t blas=nullptr;cusolverDnHandle_t solver=nullptr;
+  std::shared_ptr<arena> pool;bool low,fft=false,auxiliary_gemm3m=false;cublasHandle_t blas=nullptr;cusolverDnHandle_t solver=nullptr;
   cufftHandle plan=0;std::shared_ptr<storage> fft_work;
   std::shared_ptr<storage> transfer,pairs,kmap,qmap,negative;
   size_t nk=0,nq=0,rank=0,gemms=0,solves=0,copies=0,bytes=0;
-  implementation(bool l,size_t b):pool(std::make_shared<arena>(b)),low(l){
+  implementation(bool l,size_t b,bool gemm3m):pool(std::make_shared<arena>(b)),low(l),auxiliary_gemm3m(gemm3m){
     try {
-      check(cudaSetDevice(0),"device");check(cublasCreate(&blas),"cuBLAS create");check(cusolverDnCreate(&solver),"cuSOLVER create");
+      check(cudaSetDevice(0),"device");
+      if(auxiliary_gemm3m){
+        cudaDeviceProp properties{};check(cudaGetDeviceProperties(&properties,0),"GEMM3M device capability");
+        if(properties.major<5)throw std::runtime_error("thc_cuda_aux_gemm3m requires CUDA compute capability >= 5.0");
+      }
+      check(cublasCreate(&blas),"cuBLAS create");check(cusolverDnCreate(&solver),"cuSOLVER create");
       check(cublasSetMathMode(blas,CUBLAS_DEFAULT_MATH),"double math");
     } catch(...) {
       if(solver)cusolverDnDestroy(solver);if(blas)cublasDestroy(blas);throw;
@@ -140,7 +145,7 @@ struct thc_gpu_resident::implementation {
     ++copies;bytes+=values.size()*sizeof(T);return result;
   }
 };
-thc_gpu_resident::thc_gpu_resident(bool low,size_t budget):_impl(new implementation(low,budget)){}
+thc_gpu_resident::thc_gpu_resident(bool low,size_t budget,bool auxiliary_gemm3m):_impl(new implementation(low,budget,auxiliary_gemm3m)){}
 thc_gpu_resident::~thc_gpu_resident()=default;
 thc_gpu_resident::field thc_gpu_resident::allocate(size_t r,size_t c,size_t count,bool clear){
   dimension(r);dimension(c);dimension(count);field f{std::make_shared<storage>(_impl->pool,product(product(product(r,c),count),sizeof(z))),r,c,count,0};
@@ -159,13 +164,29 @@ std::vector<thc_gpu_resident::matrix> thc_gpu_resident::download(const field& f)
   for(size_t i=0;i<f.count;++i)result.emplace_back(Eigen::Map<const colmatrix>(packed.data()+i*f.rows*f.cols,f.rows,f.cols));return result;
 }
 thc_gpu_resident::field thc_gpu_resident::multiply(const field& a,const field& b,char ta,char tb,double scale){
+  return multiply_impl(a,b,ta,tb,scale,false);
+}
+thc_gpu_resident::field thc_gpu_resident::multiply_impl(const field& a,const field& b,char ta,char tb,double scale,bool gemm3m){
+  auto op=[](char c){
+    if(c=='N')return CUBLAS_OP_N;if(c=='T')return CUBLAS_OP_T;if(c=='C')return CUBLAS_OP_C;
+    throw std::runtime_error("THC CUDA invalid GEMM transpose");
+  };
+  const auto opa=op(ta),opb=op(tb);
   size_t ar=ta=='N'?a.rows:a.cols,ac=ta=='N'?a.cols:a.rows,br=tb=='N'?b.rows:b.cols,bc=tb=='N'?b.cols:b.rows,count=std::max(a.count,b.count);
-  if(ac!=br || (a.count!=1 && a.count!=count) || (b.count!=1 && b.count!=count))throw std::runtime_error("THC batched GEMM mismatch");
+  if(!a.owner || !b.owner || ac!=br || (a.count!=1 && a.count!=count) || (b.count!=1 && b.count!=count))throw std::runtime_error("THC batched GEMM mismatch");
+  const int rows=dimension(ar),cols=dimension(bc),inner=dimension(ac),lda=dimension(a.rows),ldb=dimension(b.rows),batch=dimension(count);
+  const size_t stride_a=a.count==1?0:product(a.rows,a.cols),stride_b=b.count==1?0:product(b.rows,b.cols),stride_c=product(ar,bc);
   auto out=allocate(ar,bc,count);z alpha=make_cuDoubleComplex(scale,0),beta=make_cuDoubleComplex(0,0);
-  auto op=[](char c){return c=='N'?CUBLAS_OP_N:c=='T'?CUBLAS_OP_T:CUBLAS_OP_C;};
-  check(cublasZgemmStridedBatched(_impl->blas,op(ta),op(tb),dimension(ar),dimension(bc),dimension(ac),&alpha,data(a),dimension(a.rows),
-                                 a.count==1?0:a.rows*a.cols,data(b),dimension(b.rows),b.count==1?0:b.rows*b.cols,&beta,
-                                 data(out),dimension(ar),ar*bc,dimension(count)),"batched GEMM");
+  if(gemm3m){
+    // cuBLAS has no double-complex GEMM3M batched entry point. Each call
+    // receives one column-major matrix; zero offsets broadcast single fields.
+    for(size_t i=0;i<count;++i)
+      check(cublasZgemm3m(_impl->blas,opa,opb,rows,cols,inner,&alpha,data(a)+i*stride_a,lda,
+                         data(b)+i*stride_b,ldb,&beta,data(out)+i*stride_c,rows),"auxiliary GEMM3M");
+  }else{
+    check(cublasZgemmStridedBatched(_impl->blas,opa,opb,rows,cols,inner,&alpha,data(a),lda,stride_a,
+                                   data(b),ldb,stride_b,&beta,data(out),rows,stride_c,batch),"batched GEMM");
+  }
   _impl->gemms+=count;return out;
 }
 thc_gpu_resident::field thc_gpu_resident::project(const field& x,const field& g){auto first=multiply(x,g);return multiply(first,x,'N','C');}
@@ -184,11 +205,13 @@ void thc_gpu_resident::copy(const field& out,const field& value){same(out,value)
 void thc_gpu_resident::zero(const field& out){check(cudaMemsetAsync(data(out),0,entries(out)*sizeof(z)),"field zero");}
 thc_gpu_resident::field thc_gpu_resident::compress(const field& m,const field& response){
   if(response.rows!=response.cols || m.rows!=response.rows)throw std::runtime_error("THC compression dimensions");
-  auto left=multiply(m,response,'C','N');return multiply(left,m);
+  auto left=multiply_impl(m,response,'C','N',1.,_impl->auxiliary_gemm3m);
+  return multiply_impl(left,m,'N','N',1.,_impl->auxiliary_gemm3m);
 }
 thc_gpu_resident::field thc_gpu_resident::expand(const field& m,const field& core){
   if(core.rows!=core.cols || m.cols!=core.rows)throw std::runtime_error("THC expansion dimensions");
-  auto left=multiply(m,core);return multiply(left,m,'N','C');
+  auto left=multiply_impl(m,core,'N','N',1.,_impl->auxiliary_gemm3m);
+  return multiply_impl(left,m,'N','C',1.,_impl->auxiliary_gemm3m);
 }
 thc_gpu_resident::field thc_gpu_resident::screen_core(const field& polarization){
   return solve_response(polarization,polarization);

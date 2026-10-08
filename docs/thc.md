@@ -34,6 +34,14 @@ use batching when there are at least 32 frequencies, based on workstation
 microbenchmarks. Other systems reuse one cuSOLVER workspace across frequencies.
 Both paths check factorization status, solve status, and residuals.
 
+`--thc_cuda_aux_gemm3m true` explicitly selects complex-double Gauss GEMM3M
+for auxiliary compression and expansion. The default is false. It changes the
+floating-point operation order and uses individual cuBLAS calls per batch;
+performance depends on shape and GPU. HF, projections, IR transforms, point
+screening, LU and residual checks retain the standard backend. Explicit enable
+requires compute capability at least 5.0. Compare full GW time and numerical
+results when choosing this backend.
+
 `--thc_gw_k_contraction direct|fft` defaults to direct. FFT uses cached batched
 cuFFT plans on complete Cartesian commensurate meshes. The shared mesh mapper
 preserves shifted cosets and shuffled k/q ordering. Complex correlations use

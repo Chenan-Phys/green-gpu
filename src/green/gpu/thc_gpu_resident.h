@@ -21,7 +21,9 @@ namespace green::gpu {
       field slice(size_t first,size_t number=1) const;
       field reshape(size_t r,size_t c,size_t batches=1) const;
     };
-    thc_gpu_resident(bool low_memory,size_t budget);
+    // Gauss GEMM3M is an explicit, complex-double experiment limited to the
+    // auxiliary compression/expansion helpers. All other GEMMs stay standard.
+    thc_gpu_resident(bool low_memory,size_t budget,bool auxiliary_gemm3m=false);
     ~thc_gpu_resident();
     thc_gpu_resident(const thc_gpu_resident&)=delete;
     thc_gpu_resident& operator=(const thc_gpu_resident&)=delete;
@@ -59,6 +61,7 @@ namespace green::gpu {
     size_t host_transfer_calls()const;
     size_t host_transfer_bytes()const;
   private:
+    field multiply_impl(const field& a,const field& b,char trans_a,char trans_b,double scale,bool gemm3m);
     field solve_response(field polarization,field rhs);
     struct implementation;
     std::unique_ptr<implementation> _impl;
