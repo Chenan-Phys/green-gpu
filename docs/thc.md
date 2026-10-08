@@ -103,8 +103,9 @@ representation. These controls do not change the fitted factors or fit tolerance
   this option is incompatible with explicit orbital Sigma. Zero preserves the
   original per-spin point path. Benchmark the size for the intended dimensions.
 
-MBPT enables OpenMP when available with `GREEN_THC_OPENMP=ON` (default). Set it
-OFF for a serial build; requesting CPU workers above one then produces an error.
-A pre-existing GF2 tau loop was rewritten with one induction variable to make it
-valid OpenMP syntax, preserving all original tau indices. Rebuild the coordinated
+MBPT uses standard C++ threads scoped to the THC Sigma kernel. It does not
+activate legacy OpenMP tensor loops. Worker code uses borrowed Eigen maps of
+buffers whose owners stay alive through every join; it avoids ndarray slice
+creation because GREEN v1.0.0 storage reference counting is non-atomic.
+Rebuild the coordinated
 symmetry, GPU and MBPT revisions together after changing resident APIs.
